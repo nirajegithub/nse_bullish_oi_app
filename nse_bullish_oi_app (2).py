@@ -1,9 +1,16 @@
 """
 NSE Bullish OI Scraper — Streamlit App
-Finds stocks with Rise in OI + Rise in Price (long build-up) by calling
-NSE's own "Change in Open Interest" endpoint directly — the same one that
-powers nseindia.com/market-data/oi-change with the "Rise in OI and Rise
-in Price" filter already applied server-side.
+Finds contracts with Rise in OI + Rise in Price (long build-up) using
+NSE's confirmed "live-analysis-oi-spurts-contracts" endpoint, which
+returns data pre-bucketed into:
+  - Rise-in-OI-Rise   <- what we want (long build-up)
+  - Rise-in-OI-Slide
+  - Slide-in-OI-Rise
+  - Slide-in-OI-Slide
+
+This matches the "Rise in OI and Rise in Price" filter on
+nseindia.com/market-data/oi-change exactly, with real pChangeInOI and
+pChange fields already computed server-side — no extra requests needed.
 
 Auto-refreshes every 30 minutes.
 
@@ -22,15 +29,8 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
 BASE = "https://www.nseindia.com"
-# Same "liveEquity-derivatives" family used for Most Active Contracts
-# (index=top20_contracts). The "Change in Open Interest" page's dropdown
-# uses view=Rise-in-OI-Rise for exactly the filter we want.
-CHANGE_IN_OI_URL = f"{BASE}/api/live-analysis-oi-spurts-underlyings"  # fallback, replaced below
-CANDIDATE_URLS = [
-    f"{BASE}/api/liveEquity-derivatives?index=Rise-in-OI-Rise",
-    f"{BASE}/api/live-analysis-changeInOI?view=Rise-in-OI-Rise",
-    f"{BASE}/api/change-in-oi?view=Rise-in-OI-Rise",
-]
+OI_SPURTS_CONTRACTS_URL = f"{BASE}/api/live-analysis-oi-spurts-contracts"
+TARGET_BUCKET = "Rise-in-OI-Rise"
 
 HEADERS = {
     "User-Agent": (
@@ -44,29 +44,9 @@ HEADERS = {
 
 REFRESH_INTERVAL_MS = 30 * 60 * 1000  # 30 minutes
 
-# Possible field-name variants NSE might use — we try each until one matches,
-# since I can't verify the exact schema of this endpoint from my sandbox.
-SYMBOL_KEYS = ["symbol", "underlying"]
-INSTRUMENT_KEYS = ["instrumentType", "instrument"]
-EXPIRY_KEYS = ["expiryDate", "expiry"]
-STRIKE_KEYS = ["strikePrice"]
-OPTTYPE_KEYS = ["optionType"]
-OI_KEYS = ["openInterest", "latestOI"]
-CHG_OI_KEYS = ["changeInOI", "chngInOI"]
-PCHG_OI_KEYS = ["pchangeinOpenInterest", "changeInOIPercentage", "avgInOI", "pChangeInOI"]
-LTP_KEYS = ["lastPrice", "ltp"]
-PREV_CLOSE_KEYS = ["prevClose", "previousClose"]
-PCHG_PRICE_KEYS = ["pChange", "changeInPricePercentage"]
-
-
-def first_present(row, keys):
-    for k in keys:
-        if k in row and row[k] is not None:
-            return row[k]
-    return None
-
 
 def get_session():
+    """NSE requires cookies from a normal page load first, or API calls 401/403."""
     session = requests.Session()
     session.headers.update(HEADERS)
     session.get(BASE, timeout=10)
@@ -77,58 +57,41 @@ def get_session():
 
 
 @st.cache_data(ttl=30 * 60, show_spinner=False)
-def fetch_bullish_data():
-    """
-    Tries each candidate URL for the 'Change in Open Interest' /
-    'Rise in OI and Rise in Price' endpoint until one returns usable data.
-    Returns (dataframe, raw_json, url_used, errors_by_url).
-    """
+def fetch_rise_in_oi_rise():
     session = get_session()
-    errors = {}
+    resp = session.get(OI_SPURTS_CONTRACTS_URL, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
 
-    for url in CANDIDATE_URLS:
-        try:
-            resp = session.get(url, timeout=10)
-            resp.raise_for_status()
-            data = resp.json()
-            rows = data.get("data", data) if isinstance(data, dict) else data
-            if isinstance(rows, dict):
-                flat = []
-                for v in rows.values():
-                    if isinstance(v, list):
-                        flat.extend(v)
-                rows = flat
-            if rows:
-                return rows, data, url, errors
-        except Exception as e:
-            errors[url] = str(e)
-            time.sleep(0.5)
+    rows = []
+    for bucket_obj in data.get("data", []):
+        if TARGET_BUCKET in bucket_obj:
+            rows = bucket_obj[TARGET_BUCKET]
+            break
 
-    return [], {}, None, errors
+    return rows, data
 
 
 def build_dataframe(rows):
     records = []
     for r in rows:
-        symbol = first_present(r, SYMBOL_KEYS)
-        if not symbol:
-            continue
         records.append({
-            "Symbol": symbol,
-            "Instrument": first_present(r, INSTRUMENT_KEYS),
-            "Expiry": first_present(r, EXPIRY_KEYS),
-            "Strike": first_present(r, STRIKE_KEYS),
-            "Type": first_present(r, OPTTYPE_KEYS),
-            "OI": first_present(r, OI_KEYS),
-            "Change in OI": first_present(r, CHG_OI_KEYS),
-            "% Chg in OI": first_present(r, PCHG_OI_KEYS),
-            "LTP": first_present(r, LTP_KEYS),
-            "Prev Close": first_present(r, PREV_CLOSE_KEYS),
+            "Symbol": r.get("symbol"),
+            "Instrument": r.get("instrument"),
+            "Expiry": r.get("expiryDate"),
+            "Strike": r.get("strikePrice"),
+            "Type": r.get("optionType"),
+            "OI": r.get("latestOI"),
+            "Change in OI": r.get("changeInOI"),
+            "% Chg in OI": r.get("pChangeInOI"),
+            "LTP": r.get("ltp"),
+            "Prev Close": r.get("prevClose"),
+            "% Chg Price": r.get("pChange"),
+            "Underlying Price": r.get("underlyingValue"),
         })
     df = pd.DataFrame(records)
-    if not df.empty and "% Chg in OI" in df.columns:
-        df["% Chg in OI"] = pd.to_numeric(df["% Chg in OI"], errors="coerce")
-        df = df.sort_values("% Chg in OI", ascending=False).reset_index(drop=True)
+    if not df.empty:
+        df = df.sort_values("Change in OI", ascending=False).reset_index(drop=True)
     return df
 
 
@@ -144,49 +107,32 @@ top_n = st.slider("How many rows to show?", min_value=3, max_value=30, value=5)
 manual_refresh = st.button("Refresh now", type="secondary")
 
 if manual_refresh:
-    fetch_bullish_data.clear()
+    fetch_rise_in_oi_rise.clear()
 
 with st.spinner("Fetching from NSE..."):
     try:
-        rows, raw, url_used, errors = fetch_bullish_data()
+        rows, raw = fetch_rise_in_oi_rise()
 
         st.caption(
             f"Last updated: {datetime.now().strftime('%H:%M:%S')}  •  "
-            f"Auto-refresh #{refresh_count}  •  Next refresh in ~30 min"
+            f"Auto-refresh #{refresh_count}  •  Next refresh in ~30 min  •  "
+            f"NSE timestamp: {raw.get('timestamp', 'n/a')}"
         )
 
         if not rows:
-            st.error(
-                "Couldn't fetch data from any known endpoint variant. "
-                "See 'Endpoint attempts (debug)' below for the exact errors — "
-                "this usually means NSE changed the URL again, or is blocking "
-                "this server's IP."
-            )
+            st.warning("No contracts currently in the 'Rise in OI and Rise in Price' bucket.")
         else:
-            st.caption(f"Endpoint used: `{url_used}`")
             df = build_dataframe(rows)
-            if df.empty:
-                st.warning("Got a response, but couldn't parse recognizable fields. Check raw response below.")
-            else:
-                st.success(f"Found {len(df)} entries. Showing top {top_n}.")
-                st.dataframe(df.head(top_n), use_container_width=True, hide_index=True)
-
-        with st.expander("Endpoint attempts (debug)"):
-            st.write("URLs tried, in order:")
-            for u in CANDIDATE_URLS:
-                if u == url_used:
-                    st.write(f"✅ `{u}` — worked")
-                elif u in errors:
-                    st.write(f"❌ `{u}` — {errors[u]}")
-                else:
-                    st.write(f"⏭️ `{u}` — not tried (earlier one succeeded)")
+            st.success(f"Found {len(df)} contracts. Showing top {top_n} by Change in OI.")
+            st.dataframe(df.head(top_n), use_container_width=True, hide_index=True)
 
         with st.expander("Raw API response (debug)"):
             st.json(raw)
 
+    except requests.exceptions.HTTPError as e:
+        st.error(f"NSE blocked the request ({e}). Try again in a few seconds.")
     except Exception as e:
         st.error(f"Something went wrong: {e}")
 
 st.divider()
 st.caption("⚠️ Informational only, not investment advice. Best run during market hours (9:15 AM–3:30 PM IST).")
-            
