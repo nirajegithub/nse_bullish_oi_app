@@ -1,7 +1,9 @@
 """
 NSE Bullish OI Scraper — Streamlit App
-Finds stocks with Rise in OI + Rise in Price (long build-up)
-by combining NSE's OI Spurts data with per-symbol price data.
+Finds stocks with Rise in OI + Rise in Price (long build-up) by calling
+NSE's own "Change in Open Interest" endpoint directly — the same one that
+powers nseindia.com/market-data/oi-change with the "Rise in OI and Rise
+in Price" filter already applied server-side.
 
 Auto-refreshes every 30 minutes.
 
@@ -20,8 +22,15 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 
 BASE = "https://www.nseindia.com"
-OI_URL = f"{BASE}/api/live-analysis-oi-spurts-underlyings"
-QUOTE_URL = f"{BASE}/api/quote-equity"  # ?symbol=XXX  -> stable per-symbol endpoint
+# Same "liveEquity-derivatives" family used for Most Active Contracts
+# (index=top20_contracts). The "Change in Open Interest" page's dropdown
+# uses view=Rise-in-OI-Rise for exactly the filter we want.
+CHANGE_IN_OI_URL = f"{BASE}/api/live-analysis-oi-spurts-underlyings"  # fallback, replaced below
+CANDIDATE_URLS = [
+    f"{BASE}/api/liveEquity-derivatives?index=Rise-in-OI-Rise",
+    f"{BASE}/api/live-analysis-changeInOI?view=Rise-in-OI-Rise",
+    f"{BASE}/api/change-in-oi?view=Rise-in-OI-Rise",
+]
 
 HEADERS = {
     "User-Agent": (
@@ -30,128 +39,154 @@ HEADERS = {
     ),
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
-    "Referer": f"{BASE}/market-data/oi-spurts",
+    "Referer": f"{BASE}/market-data/oi-change",
 }
 
 REFRESH_INTERVAL_MS = 30 * 60 * 1000  # 30 minutes
-REQUEST_DELAY_SEC = 0.4  # stay under NSE's ~3 req/sec limit
+
+# Possible field-name variants NSE might use — we try each until one matches,
+# since I can't verify the exact schema of this endpoint from my sandbox.
+SYMBOL_KEYS = ["symbol", "underlying"]
+INSTRUMENT_KEYS = ["instrumentType", "instrument"]
+EXPIRY_KEYS = ["expiryDate", "expiry"]
+STRIKE_KEYS = ["strikePrice"]
+OPTTYPE_KEYS = ["optionType"]
+OI_KEYS = ["openInterest", "latestOI"]
+CHG_OI_KEYS = ["changeInOI", "chngInOI"]
+PCHG_OI_KEYS = ["pchangeinOpenInterest", "changeInOIPercentage", "avgInOI", "pChangeInOI"]
+LTP_KEYS = ["lastPrice", "ltp"]
+PREV_CLOSE_KEYS = ["prevClose", "previousClose"]
+PCHG_PRICE_KEYS = ["pChange", "changeInPricePercentage"]
+
+
+def first_present(row, keys):
+    for k in keys:
+        if k in row and row[k] is not None:
+            return row[k]
+    return None
 
 
 def get_session():
-    """NSE requires cookies from a normal page load first, or API calls 401/403."""
     session = requests.Session()
     session.headers.update(HEADERS)
     session.get(BASE, timeout=10)
     time.sleep(1)
-    session.get(f"{BASE}/market-data/oi-spurts", timeout=10)
+    session.get(f"{BASE}/market-data/oi-change", timeout=10)
     time.sleep(1)
     return session
-
-
-def flatten_oi_rows(oi_data):
-    """The 'data' key holds sub-lists keyed by underlying type; flatten into one list."""
-    rows = oi_data.get("data", {})
-    flat = []
-    if isinstance(rows, dict):
-        for v in rows.values():
-            if isinstance(v, list):
-                flat.extend(v)
-    elif isinstance(rows, list):
-        flat = rows
-    return flat
 
 
 @st.cache_data(ttl=30 * 60, show_spinner=False)
 def fetch_bullish_data():
     """
-    1. Fetch OI Spurts data, compute % change in OI per symbol.
-    2. Keep only symbols where OI % change > 0 (reduces how many price
-       lookups we need to make, since we only care about bullish OI anyway).
-    3. For each of those, fetch live price change % from the per-symbol
-       quote endpoint.
-    4. Return combined records + the raw OI JSON for debugging.
+    Tries each candidate URL for the 'Change in Open Interest' /
+    'Rise in OI and Rise in Price' endpoint until one returns usable data.
+    Returns (dataframe, raw_json, url_used, errors_by_url).
     """
     session = get_session()
+    errors = {}
 
-    oi_resp = session.get(OI_URL, timeout=10)
-    oi_resp.raise_for_status()
-    oi_data = oi_resp.json()
-
-    flat_rows = flatten_oi_rows(oi_data)
-
-    oi_candidates = []
-    for r in flat_rows:
-        symbol = r.get("symbol")
-        prev_oi = r.get("prevOI")
-        change_in_oi = r.get("changeInOI")
-        if symbol and prev_oi not in (None, 0) and change_in_oi is not None:
-            oi_pct = (float(change_in_oi) / float(prev_oi)) * 100
-            if oi_pct > 0:
-                oi_candidates.append({"symbol": symbol, "oi_pct": oi_pct})
-
-    records = []
-    price_errors = 0
-    for c in oi_candidates:
-        symbol = c["symbol"]
+    for url in CANDIDATE_URLS:
         try:
-            resp = session.get(QUOTE_URL, params={"symbol": symbol}, timeout=10)
+            resp = session.get(url, timeout=10)
             resp.raise_for_status()
-            q = resp.json()
-            p_change = q.get("priceInfo", {}).get("pChange")
-            if p_change is not None and float(p_change) > 0:
-                records.append({
-                    "Symbol": symbol,
-                    "OI Change %": round(c["oi_pct"], 2),
-                    "Price Change %": round(float(p_change), 2),
-                })
-        except Exception:
-            price_errors += 1
-        time.sleep(REQUEST_DELAY_SEC)
+            data = resp.json()
+            rows = data.get("data", data) if isinstance(data, dict) else data
+            if isinstance(rows, dict):
+                flat = []
+                for v in rows.values():
+                    if isinstance(v, list):
+                        flat.extend(v)
+                rows = flat
+            if rows:
+                return rows, data, url, errors
+        except Exception as e:
+            errors[url] = str(e)
+            time.sleep(0.5)
 
+    return [], {}, None, errors
+
+
+def build_dataframe(rows):
+    records = []
+    for r in rows:
+        symbol = first_present(r, SYMBOL_KEYS)
+        if not symbol:
+            continue
+        records.append({
+            "Symbol": symbol,
+            "Instrument": first_present(r, INSTRUMENT_KEYS),
+            "Expiry": first_present(r, EXPIRY_KEYS),
+            "Strike": first_present(r, STRIKE_KEYS),
+            "Type": first_present(r, OPTTYPE_KEYS),
+            "OI": first_present(r, OI_KEYS),
+            "Change in OI": first_present(r, CHG_OI_KEYS),
+            "% Chg in OI": first_present(r, PCHG_OI_KEYS),
+            "LTP": first_present(r, LTP_KEYS),
+            "Prev Close": first_present(r, PREV_CLOSE_KEYS),
+        })
     df = pd.DataFrame(records)
-    if not df.empty:
-        df = df.sort_values("OI Change %", ascending=False).reset_index(drop=True)
-
-    return df, oi_data, len(oi_candidates), price_errors
+    if not df.empty and "% Chg in OI" in df.columns:
+        df["% Chg in OI"] = pd.to_numeric(df["% Chg in OI"], errors="coerce")
+        df = df.sort_values("% Chg in OI", ascending=False).reset_index(drop=True)
+    return df
 
 
 # ---------------- UI ----------------
 
-st.set_page_config(page_title="NSE Bullish OI Finder", layout="centered")
+st.set_page_config(page_title="NSE Bullish OI Finder", layout="wide")
 st.title("📈 NSE Bullish OI Finder")
 st.caption("Rise in OI + Rise in Price → possible long build-up by big players")
 
 refresh_count = st_autorefresh(interval=REFRESH_INTERVAL_MS, key="oi_autorefresh")
 
-top_n = st.slider("How many stocks to show?", min_value=3, max_value=20, value=5)
+top_n = st.slider("How many rows to show?", min_value=3, max_value=30, value=5)
 manual_refresh = st.button("Refresh now", type="secondary")
 
 if manual_refresh:
     fetch_bullish_data.clear()
 
-with st.spinner("Fetching from NSE (this can take 20-60s — checking price for each OI-rising stock)..."):
+with st.spinner("Fetching from NSE..."):
     try:
-        df, oi_raw, num_candidates, num_errors = fetch_bullish_data()
+        rows, raw, url_used, errors = fetch_bullish_data()
 
         st.caption(
             f"Last updated: {datetime.now().strftime('%H:%M:%S')}  •  "
             f"Auto-refresh #{refresh_count}  •  Next refresh in ~30 min"
         )
-        st.caption(f"Checked {num_candidates} stocks with rising OI  •  {num_errors} price lookups failed")
 
-        if df.empty:
-            st.warning("No stocks matched Rise in OI + Rise in Price right now.")
+        if not rows:
+            st.error(
+                "Couldn't fetch data from any known endpoint variant. "
+                "See 'Endpoint attempts (debug)' below for the exact errors — "
+                "this usually means NSE changed the URL again, or is blocking "
+                "this server's IP."
+            )
         else:
-            st.success(f"Found {len(df)} bullish stocks. Showing top {top_n}.")
-            st.dataframe(df.head(top_n), use_container_width=True, hide_index=True)
+            st.caption(f"Endpoint used: `{url_used}`")
+            df = build_dataframe(rows)
+            if df.empty:
+                st.warning("Got a response, but couldn't parse recognizable fields. Check raw response below.")
+            else:
+                st.success(f"Found {len(df)} entries. Showing top {top_n}.")
+                st.dataframe(df.head(top_n), use_container_width=True, hide_index=True)
 
-        with st.expander("Raw OI API response (debug)"):
-            st.json(oi_raw)
+        with st.expander("Endpoint attempts (debug)"):
+            st.write("URLs tried, in order:")
+            for u in CANDIDATE_URLS:
+                if u == url_used:
+                    st.write(f"✅ `{u}` — worked")
+                elif u in errors:
+                    st.write(f"❌ `{u}` — {errors[u]}")
+                else:
+                    st.write(f"⏭️ `{u}` — not tried (earlier one succeeded)")
 
-    except requests.exceptions.HTTPError as e:
-        st.error(f"NSE blocked the request ({e}). Try again in a few seconds.")
+        with st.expander("Raw API response (debug)"):
+            st.json(raw)
+
     except Exception as e:
         st.error(f"Something went wrong: {e}")
 
 st.divider()
 st.caption("⚠️ Informational only, not investment advice. Best run during market hours (9:15 AM–3:30 PM IST).")
+            
