@@ -1,16 +1,17 @@
 """
-NSE Bullish OI Scraper — Streamlit App
-Finds contracts with Rise in OI + Rise in Price (long build-up) using
-NSE's confirmed "live-analysis-oi-spurts-contracts" endpoint, which
-returns data pre-bucketed into:
-  - Rise-in-OI-Rise   <- what we want (long build-up)
-  - Rise-in-OI-Slide
-  - Slide-in-OI-Rise
-  - Slide-in-OI-Slide
+NSE OI Trend Finder — Streamlit App
+Classifies F&O contracts into the four standard OI/Price trend buckets,
+then enriches the top rows with historical technicals: Volume Spike,
+RSI(14), 20-day SMA, and consecutive "days up" streak.
 
-This matches the "Rise in OI and Rise in Price" filter on
-nseindia.com/market-data/oi-change exactly, with real pChangeInOI and
-pChange fields already computed server-side — no extra requests needed.
+Endpoints used:
+  - live-analysis-oi-spurts-contracts  -> OI/price trend buckets
+  - historical/cm/equity               -> daily OHLCV history per symbol
+    (used to compute RSI, SMA, volume spike, days-up streak)
+
+These are descriptive stats based on current/historical data — not trade
+signals, entries, stop-losses, or targets. Always do your own risk
+management.
 
 Auto-refreshes every 30 minutes.
 
@@ -21,7 +22,7 @@ Run locally (needs internet access to nseindia.com):
 """
 
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import requests
 import pandas as pd
@@ -30,7 +31,15 @@ from streamlit_autorefresh import st_autorefresh
 
 BASE = "https://www.nseindia.com"
 OI_SPURTS_CONTRACTS_URL = f"{BASE}/api/live-analysis-oi-spurts-contracts"
-TARGET_BUCKET = "Rise-in-OI-Rise"
+HISTORICAL_URL = f"{BASE}/api/historical/cm/equity"
+VOLUME_GAINERS_URL = f"{BASE}/api/live-analysis-volume-gainers"
+
+BUCKET_INFO = {
+    "Rise-in-OI-Rise": ("Rise in OI + Rise in Price", "Long Buildup", "🟢"),
+    "Rise-in-OI-Slide": ("Rise in OI + Fall in Price", "Short Buildup", "🔴"),
+    "Slide-in-OI-Rise": ("Fall in OI + Rise in Price", "Short Covering", "🟡"),
+    "Slide-in-OI-Slide": ("Fall in OI + Fall in Price", "Long Unwinding", "🟠"),
+}
 
 HEADERS = {
     "User-Agent": (
@@ -43,10 +52,23 @@ HEADERS = {
 }
 
 REFRESH_INTERVAL_MS = 30 * 60 * 1000  # 30 minutes
+REQUEST_DELAY_SEC = 0.4
+
+# Candidate field names for the historical endpoint (schema unverified from
+# my sandbox — kept flexible so it degrades gracefully if names differ).
+CLOSE_KEYS = ["CH_CLOSING_PRICE", "closePrice", "close"]
+VOLUME_KEYS = ["CH_TOT_TRADED_QTY", "totalTradedQuantity", "volume"]
+DATE_KEYS = ["CH_TIMESTAMP", "mTIMESTAMP", "date"]
+
+
+def first_present(row, keys):
+    for k in keys:
+        if k in row and row[k] is not None:
+            return row[k]
+    return None
 
 
 def get_session():
-    """NSE requires cookies from a normal page load first, or API calls 401/403."""
     session = requests.Session()
     session.headers.update(HEADERS)
     session.get(BASE, timeout=10)
@@ -57,26 +79,159 @@ def get_session():
 
 
 @st.cache_data(ttl=30 * 60, show_spinner=False)
-def fetch_rise_in_oi_rise():
+def fetch_all_buckets():
     session = get_session()
     resp = session.get(OI_SPURTS_CONTRACTS_URL, timeout=10)
     resp.raise_for_status()
     data = resp.json()
 
-    rows = []
+    buckets = {}
     for bucket_obj in data.get("data", []):
-        if TARGET_BUCKET in bucket_obj:
-            rows = bucket_obj[TARGET_BUCKET]
+        for key, rows in bucket_obj.items():
+            buckets[key] = rows
+
+    return buckets, data
+
+
+@st.cache_data(ttl=30 * 60, show_spinner=False)
+def fetch_technicals(symbols):
+    """Fetch ~90 calendar days of daily history per symbol and compute
+    RSI(14), SMA(20), volume spike ratio, and consecutive days-up streak."""
+    session = get_session()
+    today = datetime.now()
+    frm = (today - timedelta(days=120)).strftime("%d-%m-%Y")
+    to = today.strftime("%d-%m-%Y")
+
+    results = {}
+    debug_first_raw = None
+
+    for symbol in symbols:
+        try:
+            resp = session.get(
+                HISTORICAL_URL,
+                params={"symbol": symbol, "series": '["EQ"]', "from": frm, "to": to},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            payload = resp.json()
+            rows = payload.get("data", [])
+            if debug_first_raw is None and rows:
+                debug_first_raw = {"symbol": symbol, "sample": rows[:2]}
+
+            parsed = []
+            for r in rows:
+                close = first_present(r, CLOSE_KEYS)
+                vol = first_present(r, VOLUME_KEYS)
+                date = first_present(r, DATE_KEYS)
+                if close is not None and vol is not None:
+                    parsed.append({"date": date, "close": float(close), "volume": float(vol)})
+
+            # Sort oldest -> newest (NSE usually returns newest first)
+            parsed.sort(key=lambda x: x["date"] or "")
+
+            if len(parsed) < 15:
+                results[symbol] = None
+            else:
+                results[symbol] = compute_technicals(parsed)
+
+        except Exception:
+            results[symbol] = None
+        time.sleep(REQUEST_DELAY_SEC)
+
+    return results, debug_first_raw
+
+
+def compute_technicals(parsed):
+    closes = [p["close"] for p in parsed]
+    volumes = [p["volume"] for p in parsed]
+
+    # RSI(14) - Wilder's smoothing
+    rsi = None
+    if len(closes) >= 15:
+        deltas = [closes[i] - closes[i - 1] for i in range(1, len(closes))]
+        gains = [max(d, 0) for d in deltas]
+        losses = [max(-d, 0) for d in deltas]
+        avg_gain = sum(gains[:14]) / 14
+        avg_loss = sum(losses[:14]) / 14
+        for i in range(14, len(deltas)):
+            avg_gain = (avg_gain * 13 + gains[i]) / 14
+            avg_loss = (avg_loss * 13 + losses[i]) / 14
+        if avg_loss == 0:
+            rsi = 100.0
+        else:
+            rs = avg_gain / avg_loss
+            rsi = 100 - (100 / (1 + rs))
+
+    # SMA(20)
+    sma20 = sum(closes[-20:]) / len(closes[-20:]) if len(closes) >= 5 else None
+
+    # Volume spike: today's volume vs avg of prior 20 days (excluding today)
+    vol_spike = None
+    if len(volumes) >= 6:
+        today_vol = volumes[-1]
+        prior = volumes[max(0, len(volumes) - 21):-1]
+        if prior:
+            avg_prior_vol = sum(prior) / len(prior)
+            if avg_prior_vol > 0:
+                vol_spike = today_vol / avg_prior_vol
+
+    # Consecutive "days up" streak (close > previous close), most recent backward
+    days_up = 0
+    for i in range(len(closes) - 1, 0, -1):
+        if closes[i] > closes[i - 1]:
+            days_up += 1
+        else:
             break
 
+    return {
+        "RSI(14)": round(rsi, 1) if rsi is not None else None,
+        "SMA20": round(sma20, 2) if sma20 is not None else None,
+        "Volume Spike (x avg)": round(vol_spike, 2) if vol_spike is not None else None,
+        "Days Up Streak": days_up,
+    }
+
+
+@st.cache_data(ttl=30 * 60, show_spinner=False)
+def fetch_volume_gainers():
+    """Confirmed-working NSE endpoint: today's volume vs 1-week and 2-week
+    average volume, computed server-side by NSE. This is the reliable
+    volume-spike source (unlike the historical-derived calc above)."""
+    session = get_session()
+    resp = session.get(VOLUME_GAINERS_URL, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    rows = data.get("data", [])
     return rows, data
 
 
-def build_dataframe(rows):
+def build_volume_gainers_df(rows):
     records = []
     for r in rows:
         records.append({
             "Symbol": r.get("symbol"),
+            "Company": r.get("companyName"),
+            "LTP": r.get("ltp"),
+            "% Chg Price": r.get("pChange"),
+            "Volume": r.get("volume"),
+            "1wk Avg Volume": r.get("week1AvgVolume"),
+            "Volume Spike vs 1wk (%)": r.get("week1volChange"),
+            "2wk Avg Volume": r.get("week2AvgVolume"),
+            "Volume Spike vs 2wk (%)": r.get("week2volChange"),
+            "Turnover (₹ Cr)": r.get("turnover"),
+        })
+    df = pd.DataFrame(records)
+    if not df.empty:
+        df = df.sort_values("Volume Spike vs 1wk (%)", ascending=False).reset_index(drop=True)
+    return df
+
+
+def build_dataframe(rows, bucket_key):
+    label, trend, emoji = BUCKET_INFO.get(bucket_key, (bucket_key, bucket_key, ""))
+    records = []
+    for r in rows:
+        records.append({
+            "Symbol": r.get("symbol"),
+            "Trend": f"{emoji} {trend}",
             "Instrument": r.get("instrument"),
             "Expiry": r.get("expiryDate"),
             "Strike": r.get("strikePrice"),
@@ -85,49 +240,137 @@ def build_dataframe(rows):
             "Change in OI": r.get("changeInOI"),
             "% Chg in OI": r.get("pChangeInOI"),
             "LTP": r.get("ltp"),
-            "Prev Close": r.get("prevClose"),
             "% Chg Price": r.get("pChange"),
             "Underlying Price": r.get("underlyingValue"),
+            "Volume": r.get("volume"),
         })
     df = pd.DataFrame(records)
     if not df.empty:
-        df = df.sort_values("Change in OI", ascending=False).reset_index(drop=True)
+        df = df.sort_values("Change in OI", key=lambda s: s.abs(), ascending=False).reset_index(drop=True)
     return df
 
 
 # ---------------- UI ----------------
 
-st.set_page_config(page_title="NSE Bullish OI Finder", layout="wide")
-st.title("📈 NSE Bullish OI Finder")
-st.caption("Rise in OI + Rise in Price → possible long build-up by big players")
+st.set_page_config(page_title="NSE OI Trend Finder", layout="wide")
+st.title("📈 NSE OI Trend Finder")
+st.caption("OI + Price trend classification, enriched with RSI, SMA, volume spike & days-up streak")
 
 refresh_count = st_autorefresh(interval=REFRESH_INTERVAL_MS, key="oi_autorefresh")
 
-top_n = st.slider("How many rows to show?", min_value=3, max_value=30, value=5)
+view_options = {
+    "🟢 Long Buildup (Rise in OI + Rise in Price)": "Rise-in-OI-Rise",
+    "🔴 Short Buildup (Rise in OI + Fall in Price)": "Rise-in-OI-Slide",
+    "🟡 Short Covering (Fall in OI + Rise in Price)": "Slide-in-OI-Rise",
+    "🟠 Long Unwinding (Fall in OI + Fall in Price)": "Slide-in-OI-Slide",
+    "🔊 Volume Gainers (today vs 1wk/2wk avg)": "VOLUME_GAINERS",
+}
+selected_view = st.selectbox("Which view do you want to see?", list(view_options.keys()))
+bucket_key = view_options[selected_view]
+is_volume_view = bucket_key == "VOLUME_GAINERS"
+
+top_n = st.slider("How many rows to show?", min_value=3, max_value=25, value=10)
+show_technicals = False
+if not is_volume_view:
+    show_technicals = st.checkbox(
+        "Add RSI/SMA/Days-Up (experimental — separate endpoint, unverified schema)", value=False
+    )
 manual_refresh = st.button("Refresh now", type="secondary")
 
 if manual_refresh:
-    fetch_rise_in_oi_rise.clear()
+    fetch_all_buckets.clear()
+    fetch_technicals.clear()
+    fetch_volume_gainers.clear()
 
 with st.spinner("Fetching from NSE..."):
     try:
-        rows, raw = fetch_rise_in_oi_rise()
+        if is_volume_view:
+            vg_rows, vg_raw = fetch_volume_gainers()
+            st.caption(
+                f"Last updated: {datetime.now().strftime('%H:%M:%S')}  •  "
+                f"Auto-refresh #{refresh_count}  •  Next refresh in ~30 min  •  "
+                f"NSE timestamp: {vg_raw.get('timestamp', 'n/a')}"
+            )
+            if not vg_rows:
+                st.warning("No volume-gainer data returned right now.")
+            else:
+                vg_df = build_volume_gainers_df(vg_rows).head(top_n)
+                st.success(f"Found {len(vg_rows)} volume gainers. Showing top {top_n} by 1-week volume spike %.")
+                st.dataframe(vg_df, use_container_width=True, hide_index=True)
+            raw = vg_raw  # for the debug expander below
 
-        st.caption(
-            f"Last updated: {datetime.now().strftime('%H:%M:%S')}  •  "
-            f"Auto-refresh #{refresh_count}  •  Next refresh in ~30 min  •  "
-            f"NSE timestamp: {raw.get('timestamp', 'n/a')}"
-        )
-
-        if not rows:
-            st.warning("No contracts currently in the 'Rise in OI and Rise in Price' bucket.")
         else:
-            df = build_dataframe(rows)
-            st.success(f"Found {len(df)} contracts. Showing top {top_n} by Change in OI.")
-            st.dataframe(df.head(top_n), use_container_width=True, hide_index=True)
+            buckets, raw = fetch_all_buckets()
+
+            st.caption(
+                f"Last updated: {datetime.now().strftime('%H:%M:%S')}  •  "
+                f"Auto-refresh #{refresh_count}  •  Next refresh in ~30 min  •  "
+                f"NSE timestamp: {raw.get('timestamp', 'n/a')}"
+            )
+
+            rows = buckets.get(bucket_key, [])
+            if not rows:
+                st.warning(f"No contracts currently in the '{selected_view}' bucket.")
+            else:
+                df = build_dataframe(rows, bucket_key)
+                df_top = df.head(top_n).copy()
+
+                # Join in confirmed-real volume-spike data where the symbol
+                # also appears in NSE's volume-gainers list (only covers
+                # today's top ~25 gainers, so many rows may show blank).
+                try:
+                    vg_rows, _ = fetch_volume_gainers()
+                    vg_lookup = {r.get("symbol"): r for r in vg_rows}
+                    df_top["Volume Spike vs 1wk (%)"] = df_top["Symbol"].map(
+                        lambda s: vg_lookup.get(s, {}).get("week1volChange")
+                    )
+                except Exception:
+                    pass
+
+                tech_debug = None
+                if show_technicals and not df_top.empty:
+                    unique_symbols = tuple(sorted(set(df_top["Symbol"].dropna())))
+                    with st.spinner(f"Fetching price history for {len(unique_symbols)} symbols..."):
+                        tech_results, tech_debug = fetch_technicals(unique_symbols)
+
+                    for col in ["RSI(14)", "SMA20", "Days Up Streak"]:
+                        df_top[col] = df_top["Symbol"].map(
+                            lambda s: (tech_results.get(s) or {}).get(col)
+                        )
+
+                    missing = [s for s in unique_symbols if tech_results.get(s) is None]
+                    if missing:
+                        st.caption(f"⚠️ Couldn't compute RSI/SMA for: {', '.join(missing)} (unverified endpoint — see debug)")
+
+                st.success(f"Found {len(df)} contracts. Showing top {top_n} by |Change in OI|.")
+                st.dataframe(df_top, use_container_width=True, hide_index=True)
+                st.caption(
+                    "Volume Spike here is blank unless the symbol is also in NSE's top volume-gainers "
+                    "list today — switch to the '🔊 Volume Gainers' view for the full ranked list."
+                )
+
+        st.divider()
+        st.markdown("**What these mean:**")
+        st.markdown(
+            "- 🟢 **Long Buildup** — new money entering long positions; often read as bullish continuation\n"
+            "- 🔴 **Short Buildup** — new money entering short positions; often read as bearish continuation\n"
+            "- 🟡 **Short Covering** — shorts closing out as price rises; can reverse quickly once covering ends\n"
+            "- 🟠 **Long Unwinding** — longs exiting as price falls; often profit-booking or stop-outs\n"
+            "- **Volume Spike vs 1wk/2wk (%)** — how much today's volume exceeds the recent average, computed by NSE directly\n"
+            "- **RSI(14)** *(experimental)* — momentum: traditionally >70 = overbought, <30 = oversold\n"
+            "- **SMA20** *(experimental)* — 20-day average closing price, a common trend reference line\n"
+            "- **Days Up Streak** *(experimental)* — consecutive daily closes higher than the previous close"
+        )
+        st.caption(
+            "These are descriptive statistics from current and historical NSE data — not entry/exit "
+            "signals, stop-losses, or targets. Combine with your own analysis and risk management."
+        )
 
         with st.expander("Raw API response (debug)"):
             st.json(raw)
+        if not is_volume_view and show_technicals and tech_debug:
+            with st.expander("Raw historical API sample (debug) — experimental endpoint"):
+                st.json(tech_debug)
 
     except requests.exceptions.HTTPError as e:
         st.error(f"NSE blocked the request ({e}). Try again in a few seconds.")
