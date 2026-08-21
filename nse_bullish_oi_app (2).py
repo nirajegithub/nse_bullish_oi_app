@@ -1,7 +1,7 @@
 """
 NSE Bullish OI Scraper — Streamlit App
 Finds stocks with Rise in OI + Rise in Price (long build-up)
-by combining NSE's OI Spurts data with NSE's F&O price-change data.
+by combining NSE's OI Spurts data with per-symbol price data.
 
 Auto-refreshes every 30 minutes.
 
@@ -21,8 +21,7 @@ from streamlit_autorefresh import st_autorefresh
 
 BASE = "https://www.nseindia.com"
 OI_URL = f"{BASE}/api/live-analysis-oi-spurts-underlyings"
-# Gives lastPrice / change / pChange for every F&O-eligible stock
-PRICE_URL = f"{BASE}/api/equity-stockIndices?index=SECURITIES%20IN%20F%26O"
+QUOTE_URL = f"{BASE}/api/quote-equity"  # ?symbol=XXX  -> stable per-symbol endpoint
 
 HEADERS = {
     "User-Agent": (
@@ -35,6 +34,7 @@ HEADERS = {
 }
 
 REFRESH_INTERVAL_MS = 30 * 60 * 1000  # 30 minutes
+REQUEST_DELAY_SEC = 0.4  # stay under NSE's ~3 req/sec limit
 
 
 def get_session():
@@ -48,76 +48,71 @@ def get_session():
     return session
 
 
+def flatten_oi_rows(oi_data):
+    """The 'data' key holds sub-lists keyed by underlying type; flatten into one list."""
+    rows = oi_data.get("data", {})
+    flat = []
+    if isinstance(rows, dict):
+        for v in rows.values():
+            if isinstance(v, list):
+                flat.extend(v)
+    elif isinstance(rows, list):
+        flat = rows
+    return flat
+
+
 @st.cache_data(ttl=30 * 60, show_spinner=False)
-def fetch_oi_and_price():
-    """Fetches both OI data and price-change data in one session and returns both raw JSONs."""
+def fetch_bullish_data():
+    """
+    1. Fetch OI Spurts data, compute % change in OI per symbol.
+    2. Keep only symbols where OI % change > 0 (reduces how many price
+       lookups we need to make, since we only care about bullish OI anyway).
+    3. For each of those, fetch live price change % from the per-symbol
+       quote endpoint.
+    4. Return combined records + the raw OI JSON for debugging.
+    """
     session = get_session()
 
     oi_resp = session.get(OI_URL, timeout=10)
     oi_resp.raise_for_status()
     oi_data = oi_resp.json()
 
-    time.sleep(0.5)
+    flat_rows = flatten_oi_rows(oi_data)
 
-    price_resp = session.get(PRICE_URL, timeout=10)
-    price_resp.raise_for_status()
-    price_data = price_resp.json()
-
-    return oi_data, price_data
-
-
-def bullish_dataframe(oi_data, price_data):
-    """
-    Joins OI-spurts data (changeInOI, prevOI) with price data (pChange) by symbol,
-    then filters for Rise in OI % + Rise in Price %.
-    """
-    # --- Build OI % change lookup: symbol -> oi_pct_change ---
-    oi_rows = oi_data.get("data", {})
-    # The "data" key holds sub-lists keyed by underlying type (e.g. "" for stocks);
-    # flatten all of them into one list of records.
-    flat_oi_rows = []
-    if isinstance(oi_rows, dict):
-        for v in oi_rows.values():
-            if isinstance(v, list):
-                flat_oi_rows.extend(v)
-    elif isinstance(oi_rows, list):
-        flat_oi_rows = oi_rows
-
-    oi_lookup = {}
-    for r in flat_oi_rows:
+    oi_candidates = []
+    for r in flat_rows:
         symbol = r.get("symbol")
         prev_oi = r.get("prevOI")
         change_in_oi = r.get("changeInOI")
         if symbol and prev_oi not in (None, 0) and change_in_oi is not None:
             oi_pct = (float(change_in_oi) / float(prev_oi)) * 100
-            oi_lookup[symbol] = oi_pct
+            if oi_pct > 0:
+                oi_candidates.append({"symbol": symbol, "oi_pct": oi_pct})
 
-    # --- Build price % change lookup: symbol -> pChange ---
-    price_rows = price_data.get("data", [])
-    price_lookup = {}
-    for r in price_rows:
-        symbol = r.get("symbol")
-        p_change = r.get("pChange")
-        if symbol and p_change is not None:
-            price_lookup[symbol] = float(p_change)
-
-    # --- Join and filter ---
     records = []
-    for symbol, oi_pct in oi_lookup.items():
-        price_pct = price_lookup.get(symbol)
-        if price_pct is None:
-            continue
-        if oi_pct > 0 and price_pct > 0:
-            records.append({
-                "Symbol": symbol,
-                "OI Change %": round(oi_pct, 2),
-                "Price Change %": round(price_pct, 2),
-            })
+    price_errors = 0
+    for c in oi_candidates:
+        symbol = c["symbol"]
+        try:
+            resp = session.get(QUOTE_URL, params={"symbol": symbol}, timeout=10)
+            resp.raise_for_status()
+            q = resp.json()
+            p_change = q.get("priceInfo", {}).get("pChange")
+            if p_change is not None and float(p_change) > 0:
+                records.append({
+                    "Symbol": symbol,
+                    "OI Change %": round(c["oi_pct"], 2),
+                    "Price Change %": round(float(p_change), 2),
+                })
+        except Exception:
+            price_errors += 1
+        time.sleep(REQUEST_DELAY_SEC)
 
     df = pd.DataFrame(records)
     if not df.empty:
         df = df.sort_values("OI Change %", ascending=False).reset_index(drop=True)
-    return df
+
+    return df, oi_data, len(oi_candidates), price_errors
 
 
 # ---------------- UI ----------------
@@ -132,17 +127,17 @@ top_n = st.slider("How many stocks to show?", min_value=3, max_value=20, value=5
 manual_refresh = st.button("Refresh now", type="secondary")
 
 if manual_refresh:
-    fetch_oi_and_price.clear()
+    fetch_bullish_data.clear()
 
-with st.spinner("Fetching from NSE..."):
+with st.spinner("Fetching from NSE (this can take 20-60s — checking price for each OI-rising stock)..."):
     try:
-        oi_raw, price_raw = fetch_oi_and_price()
-        df = bullish_dataframe(oi_raw, price_raw)
+        df, oi_raw, num_candidates, num_errors = fetch_bullish_data()
 
         st.caption(
             f"Last updated: {datetime.now().strftime('%H:%M:%S')}  •  "
             f"Auto-refresh #{refresh_count}  •  Next refresh in ~30 min"
         )
+        st.caption(f"Checked {num_candidates} stocks with rising OI  •  {num_errors} price lookups failed")
 
         if df.empty:
             st.warning("No stocks matched Rise in OI + Rise in Price right now.")
@@ -152,8 +147,6 @@ with st.spinner("Fetching from NSE..."):
 
         with st.expander("Raw OI API response (debug)"):
             st.json(oi_raw)
-        with st.expander("Raw Price API response (debug)"):
-            st.json(price_raw)
 
     except requests.exceptions.HTTPError as e:
         st.error(f"NSE blocked the request ({e}). Try again in a few seconds.")
