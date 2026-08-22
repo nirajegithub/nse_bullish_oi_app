@@ -22,29 +22,17 @@ Run locally (needs internet access to nseindia.com):
 """
 
 import time
-import json
 from datetime import datetime, timedelta
 
 import requests
 import pandas as pd
 import streamlit as st
-import streamlit.components.v1 as components
 from streamlit_autorefresh import st_autorefresh
 
 BASE = "https://www.nseindia.com"
-CHARTING_BASE = "https://charting.nseindia.com"
 OI_SPURTS_CONTRACTS_URL = f"{BASE}/api/live-analysis-oi-spurts-contracts"
 HISTORICAL_URL = f"{BASE}/api/historical/cm/equity"
 VOLUME_GAINERS_URL = f"{BASE}/api/live-analysis-volume-gainers"
-CHARTING_HISTORICAL_URL = f"{CHARTING_BASE}/v1/charts/symbolHistoricalData"
-
-# Symbol -> NSE charting token. Confirmed working: HDFCBANK. To add more
-# symbols, capture the token from NSE's own quote page (DevTools -> Network
-# -> click the charting button -> find the request with that symbol's token)
-# and add it here.
-SYMBOL_TOKENS = {
-    "HDFCBANK": 1333,
-}
 
 BUCKET_INFO = {
     "Rise-in-OI-Rise": ("Rise in OI + Rise in Price", "Long Buildup", "🟢"),
@@ -239,146 +227,6 @@ def build_volume_gainers_df(rows):
     return df
 
 
-@st.cache_data(ttl=15 * 60, show_spinner=False)
-def fetch_candles(symbol, token, days=180):
-    """Fetch daily OHLCV candles from NSE's charting backend (confirmed
-    working format: {status, data: [{time, open, high, low, close, volume}]}).
-    `token` is NSE's internal numeric ID for the symbol — see SYMBOL_TOKENS."""
-    now = datetime.now()
-    from_ts = int((now - timedelta(days=days)).timestamp())
-    to_ts = int(now.timestamp())
-
-    session = requests.Session()
-    session.headers.update(HEADERS)
-
-    resp = session.get(
-        CHARTING_HISTORICAL_URL,
-        params={
-            "fromDate": from_ts,
-            "toDate": to_ts,
-            "symbol": f"{symbol}-EQ",
-            "token": token,
-            "symbolType": "Equity",
-            "chartType": "D",
-            "timeInterval": 1,
-        },
-        timeout=10,
-    )
-    resp.raise_for_status()
-    payload = resp.json()
-    candles = payload.get("data", [])
-    # Sort oldest -> newest, dedupe by time just in case
-    candles.sort(key=lambda c: c["time"])
-    return candles
-
-
-def compute_ema(values, period):
-    """Standard EMA: seeded with SMA of the first `period` values."""
-    if len(values) < period:
-        return [None] * len(values)
-    ema = [None] * (period - 1)
-    sma = sum(values[:period]) / period
-    ema.append(sma)
-    multiplier = 2 / (period + 1)
-    for v in values[period:]:
-        ema.append((v - ema[-1]) * multiplier + ema[-1])
-    return ema
-
-
-def compute_pivot_points(prev_high, prev_low, prev_close):
-    """Standard (classic) floor-trader pivot points using the prior day's H/L/C."""
-    pp = (prev_high + prev_low + prev_close) / 3
-    r1 = 2 * pp - prev_low
-    s1 = 2 * pp - prev_high
-    r2 = pp + (prev_high - prev_low)
-    s2 = pp - (prev_high - prev_low)
-    r3 = prev_high + 2 * (pp - prev_low)
-    s3 = prev_low - 2 * (prev_high - pp)
-    return {"PP": pp, "R1": r1, "R2": r2, "R3": r3, "S1": s1, "S2": s2, "S3": s3}
-
-
-def compute_fibonacci(swing_high, swing_low):
-    """Standard Fibonacci retracement levels between a recent swing high and low."""
-    diff = swing_high - swing_low
-    levels = {}
-    for pct in [0, 23.6, 38.2, 50, 61.8, 78.6, 100]:
-        levels[f"Fib {pct}%"] = swing_high - diff * (pct / 100)
-    return levels
-
-
-def render_lightweight_chart(candles, ema9, pivots, fib_levels, symbol, height=520):
-    """Renders a candlestick chart using TradingView's open-source
-    Lightweight Charts library, with EMA9 as an overlay line and
-    pivot/fibonacci levels as horizontal price lines."""
-    chart_candles = [
-        {
-            "time": c["time"] // 1000,  # library expects unix seconds
-            "open": c["open"], "high": c["high"], "low": c["low"], "close": c["close"],
-        }
-        for c in candles
-    ]
-    ema_series = [
-        {"time": c["time"] // 1000, "value": v}
-        for c, v in zip(candles, ema9) if v is not None
-    ]
-
-    price_lines = []
-    for label, value in pivots.items():
-        color = "#2196F3" if label == "PP" else ("#4CAF50" if label.startswith("R") else "#F44336")
-        price_lines.append({"price": value, "color": color, "title": label})
-    for label, value in fib_levels.items():
-        price_lines.append({"price": value, "color": "#9C27B0", "title": label})
-
-    price_lines_js = json.dumps(price_lines)
-    candles_js = json.dumps(chart_candles)
-    ema_js = json.dumps(ema_series)
-
-    html = f"""
-    <div id="chart_container" style="width:100%; height:{height}px;"></div>
-    <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
-    <script>
-      const container = document.getElementById('chart_container');
-      const chart = LightweightCharts.createChart(container, {{
-        width: container.clientWidth,
-        height: {height},
-        layout: {{ background: {{ color: '#ffffff' }}, textColor: '#333' }},
-        grid: {{ vertLines: {{ color: '#eee' }}, horzLines: {{ color: '#eee' }} }},
-        timeScale: {{ timeVisible: false, borderColor: '#ccc' }},
-      }});
-
-      const candleSeries = chart.addCandlestickSeries({{
-        upColor: '#26a69a', downColor: '#ef5350',
-        borderVisible: false,
-        wickUpColor: '#26a69a', wickDownColor: '#ef5350',
-      }});
-      candleSeries.setData({candles_js});
-
-      const emaSeries = chart.addLineSeries({{
-        color: '#FF9800', lineWidth: 2, title: 'EMA 9',
-      }});
-      emaSeries.setData({ema_js});
-
-      const priceLines = {price_lines_js};
-      priceLines.forEach(function(pl) {{
-        candleSeries.createPriceLine({{
-          price: pl.price,
-          color: pl.color,
-          lineWidth: 1,
-          lineStyle: LightweightCharts.LineStyle.Dashed,
-          axisLabelVisible: true,
-          title: pl.title,
-        }});
-      }});
-
-      chart.timeScale().fitContent();
-      new ResizeObserver(entries => {{
-        chart.applyOptions({{ width: container.clientWidth }});
-      }}).observe(container);
-    </script>
-    """
-    components.html(html, height=height + 20)
-
-
 def tradingview_url(symbol):
     """Build a TradingView chart link for an NSE symbol. TradingView's free
     tier doesn't support pre-loading specific indicators via URL, but EMA 9,
@@ -416,6 +264,20 @@ def build_dataframe(rows, bucket_key):
 # ---------------- UI ----------------
 
 st.set_page_config(page_title="NSE OI Trend Finder", layout="wide")
+
+st.markdown(
+    """
+    <style>
+        .block-container { padding-top: 1.5rem; padding-bottom: 2rem; }
+        h1 { font-size: 1.5rem !important; margin-bottom: 0.2rem !important; }
+        h3 { font-size: 1.05rem !important; }
+        .stCaption, .st-emotion-cache-1629p8f p { font-size: 0.8rem !important; }
+        div[data-testid="stMetricValue"] { font-size: 1.1rem !important; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 st.title("📈 NSE OI Trend Finder")
 st.caption("OI + Price trend classification, enriched with RSI, SMA, volume spike & days-up streak")
 
@@ -428,24 +290,22 @@ view_options = {
     "🟠 Long Unwinding (Fall in OI + Fall in Price)": "Slide-in-OI-Slide",
     "🔊 Volume Gainers (today vs 1wk/2wk avg)": "VOLUME_GAINERS",
 }
-selected_view = st.selectbox("Which view do you want to see?", list(view_options.keys()))
+selected_view = st.selectbox("View", list(view_options.keys()), label_visibility="collapsed")
 bucket_key = view_options[selected_view]
 is_volume_view = bucket_key == "VOLUME_GAINERS"
 
-top_n = st.slider("How many rows to show?", min_value=3, max_value=25, value=10)
+with st.expander("⚙️ Filters", expanded=False):
+    top_n = st.slider("Rows to show", min_value=3, max_value=25, value=10)
+    col1, col2 = st.columns(2)
+    with col1:
+        min_volume = st.number_input("Min Volume", min_value=0, value=500000, step=50000)
+    with col2:
+        min_price = st.number_input("Min Price (LTP)", min_value=0.0, value=250.0, step=10.0)
+    show_technicals = False
+    if not is_volume_view:
+        show_technicals = st.checkbox("Add RSI/SMA/Days-Up (experimental, slower)", value=False)
 
-col1, col2 = st.columns(2)
-with col1:
-    min_volume = st.number_input("Minimum Volume", min_value=0, value=500000, step=50000)
-with col2:
-    min_price = st.number_input("Minimum Price (LTP)", min_value=0.0, value=250.0, step=10.0)
-
-show_technicals = False
-if not is_volume_view:
-    show_technicals = st.checkbox(
-        "Add RSI/SMA/Days-Up (experimental — separate endpoint, unverified schema)", value=False
-    )
-manual_refresh = st.button("Refresh now", type="secondary")
+manual_refresh = st.button("🔄 Refresh now")
 
 if manual_refresh:
     fetch_all_buckets.clear()
@@ -567,77 +427,26 @@ with st.spinner("Fetching from NSE..."):
                     )
 
         st.divider()
-        st.subheader("🕯️ Candlestick Chart — EMA9 + Pivot Points + Fibonacci")
-        st.caption(
-            "Built from NSE's own charting data. Currently only symbols with a known chart "
-            "token are supported (see note below) — this is a growing list."
-        )
+        with st.expander("ℹ️ What these mean"):
+            st.markdown(
+                "- 🟢 **Long Buildup** — new money entering long positions; often read as bullish continuation\n"
+                "- 🔴 **Short Buildup** — new money entering short positions; often read as bearish continuation\n"
+                "- 🟡 **Short Covering** — shorts closing out as price rises; can reverse quickly once covering ends\n"
+                "- 🟠 **Long Unwinding** — longs exiting as price falls; often profit-booking or stop-outs\n"
+                "- **Volume Spike vs 1wk/2wk (%)** — how much today's volume exceeds the recent average, computed by NSE directly\n"
+                "- **RSI(14)** *(experimental)* — momentum: traditionally >70 = overbought, <30 = oversold\n"
+                "- **SMA20** *(experimental)* — 20-day average closing price, a common trend reference line\n"
+                "- **Days Up Streak** *(experimental)* — consecutive daily closes higher than the previous close"
+            )
+            st.caption(
+                "These are descriptive statistics from current and historical NSE data — not entry/exit "
+                "signals, stop-losses, or targets. Combine with your own analysis and risk management."
+            )
 
-        available_symbols = sorted(SYMBOL_TOKENS.keys())
-        chart_symbol = st.selectbox("Symbol", available_symbols, key="chart_symbol_select")
-
-        if st.button("Load chart", key="load_chart_btn"):
-            try:
-                token = SYMBOL_TOKENS[chart_symbol]
-                with st.spinner(f"Fetching {chart_symbol} price history..."):
-                    candles = fetch_candles(chart_symbol, token, days=180)
-
-                if len(candles) < 20:
-                    st.warning("Not enough historical data returned to compute indicators.")
-                else:
-                    closes = [c["close"] for c in candles]
-                    ema9 = compute_ema(closes, 9)
-
-                    prev = candles[-2]  # prior completed day for pivot calc
-                    pivots = compute_pivot_points(prev["high"], prev["low"], prev["close"])
-
-                    lookback = candles[-60:] if len(candles) >= 60 else candles
-                    swing_high = max(c["high"] for c in lookback)
-                    swing_low = min(c["low"] for c in lookback)
-                    fib_levels = compute_fibonacci(swing_high, swing_low)
-
-                    render_lightweight_chart(candles, ema9, pivots, fib_levels, chart_symbol)
-
-                    last_close = closes[-1]
-                    last_ema9 = ema9[-1]
-                    if last_ema9 is not None:
-                        cross_note = "above" if last_close > last_ema9 else "below"
-                        st.caption(
-                            f"Latest close ₹{last_close:.2f} is currently **{cross_note} EMA9** "
-                            f"(₹{last_ema9:.2f}). Pivot (PP): ₹{pivots['PP']:.2f}."
-                        )
-            except requests.exceptions.HTTPError as e:
-                st.error(f"NSE blocked the chart data request ({e}). Try again shortly.")
-            except Exception as e:
-                st.error(f"Couldn't load chart: {e}")
-
-        st.caption(
-            f"⚙️ Only {len(SYMBOL_TOKENS)} symbol(s) currently supported: {', '.join(sorted(SYMBOL_TOKENS.keys()))}. "
-            "To add a symbol, its NSE charting 'token' needs to be captured once via browser DevTools "
-            "and added to the app's SYMBOL_TOKENS list."
-        )
-
-        st.divider()
-        st.markdown("**What these mean:**")
-        st.markdown(
-            "- 🟢 **Long Buildup** — new money entering long positions; often read as bullish continuation\n"
-            "- 🔴 **Short Buildup** — new money entering short positions; often read as bearish continuation\n"
-            "- 🟡 **Short Covering** — shorts closing out as price rises; can reverse quickly once covering ends\n"
-            "- 🟠 **Long Unwinding** — longs exiting as price falls; often profit-booking or stop-outs\n"
-            "- **Volume Spike vs 1wk/2wk (%)** — how much today's volume exceeds the recent average, computed by NSE directly\n"
-            "- **RSI(14)** *(experimental)* — momentum: traditionally >70 = overbought, <30 = oversold\n"
-            "- **SMA20** *(experimental)* — 20-day average closing price, a common trend reference line\n"
-            "- **Days Up Streak** *(experimental)* — consecutive daily closes higher than the previous close"
-        )
-        st.caption(
-            "These are descriptive statistics from current and historical NSE data — not entry/exit "
-            "signals, stop-losses, or targets. Combine with your own analysis and risk management."
-        )
-
-        with st.expander("Raw API response (debug)"):
+        with st.expander("🛠️ Debug: raw API response"):
             st.json(raw)
-        if not is_volume_view and show_technicals and tech_debug:
-            with st.expander("Raw historical API sample (debug) — experimental endpoint"):
+            if not is_volume_view and show_technicals and tech_debug:
+                st.markdown("**Raw historical API sample (experimental endpoint):**")
                 st.json(tech_debug)
 
     except requests.exceptions.HTTPError as e:
@@ -645,5 +454,4 @@ with st.spinner("Fetching from NSE..."):
     except Exception as e:
         st.error(f"Something went wrong: {e}")
 
-st.divider()
 st.caption("⚠️ Informational only, not investment advice. Best run during market hours (9:15 AM–3:30 PM IST).")
