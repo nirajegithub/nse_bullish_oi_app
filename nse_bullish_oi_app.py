@@ -22,17 +22,29 @@ Run locally (needs internet access to nseindia.com):
 """
 
 import time
+import json
 from datetime import datetime, timedelta
 
 import requests
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from streamlit_autorefresh import st_autorefresh
 
 BASE = "https://www.nseindia.com"
+CHARTING_BASE = "https://charting.nseindia.com"
 OI_SPURTS_CONTRACTS_URL = f"{BASE}/api/live-analysis-oi-spurts-contracts"
 HISTORICAL_URL = f"{BASE}/api/historical/cm/equity"
 VOLUME_GAINERS_URL = f"{BASE}/api/live-analysis-volume-gainers"
+CHARTING_HISTORICAL_URL = f"{CHARTING_BASE}/v1/charts/symbolHistoricalData"
+
+# Symbol -> NSE charting token. Confirmed working: HDFCBANK. To add more
+# symbols, capture the token from NSE's own quote page (DevTools -> Network
+# -> click the charting button -> find the request with that symbol's token)
+# and add it here.
+SYMBOL_TOKENS = {
+    "HDFCBANK": 1333,
+}
 
 BUCKET_INFO = {
     "Rise-in-OI-Rise": ("Rise in OI + Rise in Price", "Long Buildup", "🟢"),
@@ -207,8 +219,9 @@ def fetch_volume_gainers():
 def build_volume_gainers_df(rows):
     records = []
     for r in rows:
+        symbol = r.get("symbol")
         records.append({
-            "Symbol": r.get("symbol"),
+            "Symbol": symbol,
             "Company": r.get("companyName"),
             "LTP": r.get("ltp"),
             "% Chg Price": r.get("pChange"),
@@ -218,6 +231,7 @@ def build_volume_gainers_df(rows):
             "2wk Avg Volume": r.get("week2AvgVolume"),
             "Volume Spike vs 2wk (%)": r.get("week2volChange"),
             "Turnover (₹ Cr)": r.get("turnover"),
+            "Chart": tradingview_url(symbol),
         })
     df = pd.DataFrame(records)
     if not df.empty:
@@ -225,24 +239,173 @@ def build_volume_gainers_df(rows):
     return df
 
 
+@st.cache_data(ttl=15 * 60, show_spinner=False)
+def fetch_candles(symbol, token, days=180):
+    """Fetch daily OHLCV candles from NSE's charting backend (confirmed
+    working format: {status, data: [{time, open, high, low, close, volume}]}).
+    `token` is NSE's internal numeric ID for the symbol — see SYMBOL_TOKENS."""
+    now = datetime.now()
+    from_ts = int((now - timedelta(days=days)).timestamp())
+    to_ts = int(now.timestamp())
+
+    session = requests.Session()
+    session.headers.update(HEADERS)
+
+    resp = session.get(
+        CHARTING_HISTORICAL_URL,
+        params={
+            "fromDate": from_ts,
+            "toDate": to_ts,
+            "symbol": f"{symbol}-EQ",
+            "token": token,
+            "symbolType": "Equity",
+            "chartType": "D",
+            "timeInterval": 1,
+        },
+        timeout=10,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    candles = payload.get("data", [])
+    # Sort oldest -> newest, dedupe by time just in case
+    candles.sort(key=lambda c: c["time"])
+    return candles
+
+
+def compute_ema(values, period):
+    """Standard EMA: seeded with SMA of the first `period` values."""
+    if len(values) < period:
+        return [None] * len(values)
+    ema = [None] * (period - 1)
+    sma = sum(values[:period]) / period
+    ema.append(sma)
+    multiplier = 2 / (period + 1)
+    for v in values[period:]:
+        ema.append((v - ema[-1]) * multiplier + ema[-1])
+    return ema
+
+
+def compute_pivot_points(prev_high, prev_low, prev_close):
+    """Standard (classic) floor-trader pivot points using the prior day's H/L/C."""
+    pp = (prev_high + prev_low + prev_close) / 3
+    r1 = 2 * pp - prev_low
+    s1 = 2 * pp - prev_high
+    r2 = pp + (prev_high - prev_low)
+    s2 = pp - (prev_high - prev_low)
+    r3 = prev_high + 2 * (pp - prev_low)
+    s3 = prev_low - 2 * (prev_high - pp)
+    return {"PP": pp, "R1": r1, "R2": r2, "R3": r3, "S1": s1, "S2": s2, "S3": s3}
+
+
+def compute_fibonacci(swing_high, swing_low):
+    """Standard Fibonacci retracement levels between a recent swing high and low."""
+    diff = swing_high - swing_low
+    levels = {}
+    for pct in [0, 23.6, 38.2, 50, 61.8, 78.6, 100]:
+        levels[f"Fib {pct}%"] = swing_high - diff * (pct / 100)
+    return levels
+
+
+def render_lightweight_chart(candles, ema9, pivots, fib_levels, symbol, height=520):
+    """Renders a candlestick chart using TradingView's open-source
+    Lightweight Charts library, with EMA9 as an overlay line and
+    pivot/fibonacci levels as horizontal price lines."""
+    chart_candles = [
+        {
+            "time": c["time"] // 1000,  # library expects unix seconds
+            "open": c["open"], "high": c["high"], "low": c["low"], "close": c["close"],
+        }
+        for c in candles
+    ]
+    ema_series = [
+        {"time": c["time"] // 1000, "value": v}
+        for c, v in zip(candles, ema9) if v is not None
+    ]
+
+    price_lines = []
+    for label, value in pivots.items():
+        color = "#2196F3" if label == "PP" else ("#4CAF50" if label.startswith("R") else "#F44336")
+        price_lines.append({"price": value, "color": color, "title": label})
+    for label, value in fib_levels.items():
+        price_lines.append({"price": value, "color": "#9C27B0", "title": label})
+
+    price_lines_js = json.dumps(price_lines)
+    candles_js = json.dumps(chart_candles)
+    ema_js = json.dumps(ema_series)
+
+    html = f"""
+    <div id="chart_container" style="width:100%; height:{height}px;"></div>
+    <script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+    <script>
+      const container = document.getElementById('chart_container');
+      const chart = LightweightCharts.createChart(container, {{
+        width: container.clientWidth,
+        height: {height},
+        layout: {{ background: {{ color: '#ffffff' }}, textColor: '#333' }},
+        grid: {{ vertLines: {{ color: '#eee' }}, horzLines: {{ color: '#eee' }} }},
+        timeScale: {{ timeVisible: false, borderColor: '#ccc' }},
+      }});
+
+      const candleSeries = chart.addCandlestickSeries({{
+        upColor: '#26a69a', downColor: '#ef5350',
+        borderVisible: false,
+        wickUpColor: '#26a69a', wickDownColor: '#ef5350',
+      }});
+      candleSeries.setData({candles_js});
+
+      const emaSeries = chart.addLineSeries({{
+        color: '#FF9800', lineWidth: 2, title: 'EMA 9',
+      }});
+      emaSeries.setData({ema_js});
+
+      const priceLines = {price_lines_js};
+      priceLines.forEach(function(pl) {{
+        candleSeries.createPriceLine({{
+          price: pl.price,
+          color: pl.color,
+          lineWidth: 1,
+          lineStyle: LightweightCharts.LineStyle.Dashed,
+          axisLabelVisible: true,
+          title: pl.title,
+        }});
+      }});
+
+      chart.timeScale().fitContent();
+      new ResizeObserver(entries => {{
+        chart.applyOptions({{ width: container.clientWidth }});
+      }}).observe(container);
+    </script>
+    """
+    components.html(html, height=height + 20)
+
+
+def tradingview_url(symbol):
+    """Build a TradingView chart link for an NSE symbol. TradingView's free
+    tier doesn't support pre-loading specific indicators via URL, but EMA 9,
+    Pivot Points Standard, and Fib Retracement are all built-in indicators
+    the user can add themselves in a couple of clicks once the chart opens."""
+    if not symbol:
+        return None
+    return f"https://www.tradingview.com/chart/?symbol=NSE:{symbol}"
+
+
 def build_dataframe(rows, bucket_key):
     label, trend, emoji = BUCKET_INFO.get(bucket_key, (bucket_key, bucket_key, ""))
     records = []
     for r in rows:
+        symbol = r.get("symbol")
         records.append({
-            "Symbol": r.get("symbol"),
+            "Symbol": symbol,
             "Trend": f"{emoji} {trend}",
-            "Instrument": r.get("instrument"),
             "Expiry": r.get("expiryDate"),
             "Strike": r.get("strikePrice"),
             "Type": r.get("optionType"),
-            "OI": r.get("latestOI"),
             "Change in OI": r.get("changeInOI"),
             "% Chg in OI": r.get("pChangeInOI"),
             "LTP": r.get("ltp"),
             "% Chg Price": r.get("pChange"),
-            "Underlying Price": r.get("underlyingValue"),
             "Volume": r.get("volume"),
+            "Chart": tradingview_url(symbol),
         })
     df = pd.DataFrame(records)
     if not df.empty:
@@ -270,6 +433,13 @@ bucket_key = view_options[selected_view]
 is_volume_view = bucket_key == "VOLUME_GAINERS"
 
 top_n = st.slider("How many rows to show?", min_value=3, max_value=25, value=10)
+
+col1, col2 = st.columns(2)
+with col1:
+    min_volume = st.number_input("Minimum Volume", min_value=0, value=500000, step=50000)
+with col2:
+    min_price = st.number_input("Minimum Price (LTP)", min_value=0.0, value=250.0, step=10.0)
+
 show_technicals = False
 if not is_volume_view:
     show_technicals = st.checkbox(
@@ -294,13 +464,32 @@ with st.spinner("Fetching from NSE..."):
             if not vg_rows:
                 st.warning("No volume-gainer data returned right now.")
             else:
-                vg_df = build_volume_gainers_df(vg_rows).head(top_n)
-                st.success(f"Found {len(vg_rows)} volume gainers. Showing top {top_n} by 1-week volume spike %.")
-                st.dataframe(vg_df, use_container_width=True, hide_index=True)
+                vg_df_full = build_volume_gainers_df(vg_rows)
+                vg_df_filtered = vg_df_full[
+                    (vg_df_full["Volume"] >= min_volume) & (vg_df_full["LTP"] >= min_price)
+                ]
+                vg_df = vg_df_filtered.head(top_n)
+                st.caption(
+                    f"Filters applied: Volume ≥ {min_volume:,} and Price ≥ ₹{min_price:,.0f}  •  "
+                    f"{len(vg_df_filtered)} of {len(vg_df_full)} rows match."
+                )
+                if vg_df.empty:
+                    st.warning("No rows match your Volume/Price filters. Try lowering them.")
+                else:
+                    st.success(f"Showing top {len(vg_df)} by 1-week volume spike %.")
+                    st.dataframe(
+                        vg_df,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Chart": st.column_config.LinkColumn("Chart", display_text="📊 Open Chart")
+                        },
+                    )
             raw = vg_raw  # for the debug expander below
 
         else:
             buckets, raw = fetch_all_buckets()
+            tech_debug = None
 
             st.caption(
                 f"Last updated: {datetime.now().strftime('%H:%M:%S')}  •  "
@@ -312,42 +501,121 @@ with st.spinner("Fetching from NSE..."):
             if not rows:
                 st.warning(f"No contracts currently in the '{selected_view}' bucket.")
             else:
-                df = build_dataframe(rows, bucket_key)
-                df_top = df.head(top_n).copy()
-
-                # Join in confirmed-real volume-spike data where the symbol
-                # also appears in NSE's volume-gainers list (only covers
-                # today's top ~25 gainers, so many rows may show blank).
-                try:
-                    vg_rows, _ = fetch_volume_gainers()
-                    vg_lookup = {r.get("symbol"): r for r in vg_rows}
-                    df_top["Volume Spike vs 1wk (%)"] = df_top["Symbol"].map(
-                        lambda s: vg_lookup.get(s, {}).get("week1volChange")
-                    )
-                except Exception:
-                    pass
-
-                tech_debug = None
-                if show_technicals and not df_top.empty:
-                    unique_symbols = tuple(sorted(set(df_top["Symbol"].dropna())))
-                    with st.spinner(f"Fetching price history for {len(unique_symbols)} symbols..."):
-                        tech_results, tech_debug = fetch_technicals(unique_symbols)
-
-                    for col in ["RSI(14)", "SMA20", "Days Up Streak"]:
-                        df_top[col] = df_top["Symbol"].map(
-                            lambda s: (tech_results.get(s) or {}).get(col)
-                        )
-
-                    missing = [s for s in unique_symbols if tech_results.get(s) is None]
-                    if missing:
-                        st.caption(f"⚠️ Couldn't compute RSI/SMA for: {', '.join(missing)} (unverified endpoint — see debug)")
-
-                st.success(f"Found {len(df)} contracts. Showing top {top_n} by |Change in OI|.")
-                st.dataframe(df_top, use_container_width=True, hide_index=True)
+                df_full = build_dataframe(rows, bucket_key)
+                df_filtered = df_full[
+                    (df_full["Volume"] >= min_volume) & (df_full["LTP"] >= min_price)
+                ]
                 st.caption(
-                    "Volume Spike here is blank unless the symbol is also in NSE's top volume-gainers "
-                    "list today — switch to the '🔊 Volume Gainers' view for the full ranked list."
+                    f"Filters applied: Volume ≥ {min_volume:,} and Price ≥ ₹{min_price:,.0f}  •  "
+                    f"{len(df_filtered)} of {len(df_full)} rows match."
                 )
+
+                if df_filtered.empty:
+                    st.warning("No rows match your Volume/Price filters. Try lowering them.")
+                else:
+                    df_top = df_filtered.head(top_n).copy()
+
+                    # Join in confirmed-real volume-spike data where the symbol
+                    # also appears in NSE's volume-gainers list. Only add the
+                    # column if at least one row actually has a value — otherwise
+                    # it's just a blank column cluttering the grid.
+                    try:
+                        vg_rows, _ = fetch_volume_gainers()
+                        vg_lookup = {r.get("symbol"): r for r in vg_rows}
+                        spike_col = df_top["Symbol"].map(
+                            lambda s: vg_lookup.get(s, {}).get("week1volChange")
+                        )
+                        if spike_col.notna().any():
+                            df_top["Volume Spike vs 1wk (%)"] = spike_col
+                    except Exception:
+                        pass
+
+                    tech_debug = None
+                    if show_technicals and not df_top.empty:
+                        unique_symbols = tuple(sorted(set(df_top["Symbol"].dropna())))
+                        with st.spinner(f"Fetching price history for {len(unique_symbols)} symbols..."):
+                            tech_results, tech_debug = fetch_technicals(unique_symbols)
+
+                        for col in ["RSI(14)", "SMA20", "Days Up Streak"]:
+                            col_data = df_top["Symbol"].map(
+                                lambda s: (tech_results.get(s) or {}).get(col)
+                            )
+                            if col_data.notna().any():
+                                df_top[col] = col_data
+
+                        missing = [s for s in unique_symbols if tech_results.get(s) is None]
+                        if missing:
+                            st.caption(f"⚠️ Couldn't compute RSI/SMA for: {', '.join(missing)} (unverified endpoint — see debug)")
+
+                    st.success(f"Showing top {len(df_top)} of {len(df_filtered)} matching contracts by |Change in OI|.")
+                    st.dataframe(
+                        df_top,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Chart": st.column_config.LinkColumn("Chart", display_text="📊 Open Chart")
+                        },
+                    )
+                    st.caption(
+                        "Charts open on TradingView. EMA 9, Pivot Points Standard, and Fib Retracement are "
+                        "built-in indicators there — add them via the chart's indicator search (they aren't "
+                        "preset, since TradingView's free tier doesn't support that via URL)."
+                    )
+                    st.caption(
+                        "Volume Spike here is blank unless the symbol is also in NSE's top volume-gainers "
+                        "list today — switch to the '🔊 Volume Gainers' view for the full ranked list."
+                    )
+
+        st.divider()
+        st.subheader("🕯️ Candlestick Chart — EMA9 + Pivot Points + Fibonacci")
+        st.caption(
+            "Built from NSE's own charting data. Currently only symbols with a known chart "
+            "token are supported (see note below) — this is a growing list."
+        )
+
+        available_symbols = sorted(SYMBOL_TOKENS.keys())
+        chart_symbol = st.selectbox("Symbol", available_symbols, key="chart_symbol_select")
+
+        if st.button("Load chart", key="load_chart_btn"):
+            try:
+                token = SYMBOL_TOKENS[chart_symbol]
+                with st.spinner(f"Fetching {chart_symbol} price history..."):
+                    candles = fetch_candles(chart_symbol, token, days=180)
+
+                if len(candles) < 20:
+                    st.warning("Not enough historical data returned to compute indicators.")
+                else:
+                    closes = [c["close"] for c in candles]
+                    ema9 = compute_ema(closes, 9)
+
+                    prev = candles[-2]  # prior completed day for pivot calc
+                    pivots = compute_pivot_points(prev["high"], prev["low"], prev["close"])
+
+                    lookback = candles[-60:] if len(candles) >= 60 else candles
+                    swing_high = max(c["high"] for c in lookback)
+                    swing_low = min(c["low"] for c in lookback)
+                    fib_levels = compute_fibonacci(swing_high, swing_low)
+
+                    render_lightweight_chart(candles, ema9, pivots, fib_levels, chart_symbol)
+
+                    last_close = closes[-1]
+                    last_ema9 = ema9[-1]
+                    if last_ema9 is not None:
+                        cross_note = "above" if last_close > last_ema9 else "below"
+                        st.caption(
+                            f"Latest close ₹{last_close:.2f} is currently **{cross_note} EMA9** "
+                            f"(₹{last_ema9:.2f}). Pivot (PP): ₹{pivots['PP']:.2f}."
+                        )
+            except requests.exceptions.HTTPError as e:
+                st.error(f"NSE blocked the chart data request ({e}). Try again shortly.")
+            except Exception as e:
+                st.error(f"Couldn't load chart: {e}")
+
+        st.caption(
+            f"⚙️ Only {len(SYMBOL_TOKENS)} symbol(s) currently supported: {', '.join(sorted(SYMBOL_TOKENS.keys()))}. "
+            "To add a symbol, its NSE charting 'token' needs to be captured once via browser DevTools "
+            "and added to the app's SYMBOL_TOKENS list."
+        )
 
         st.divider()
         st.markdown("**What these mean:**")
