@@ -78,11 +78,27 @@ def get_session():
     return session
 
 
+def safe_get(session, url, retries=3, backoff=1.5, **kwargs):
+    """GET with retry-and-backoff. NSE occasionally blocks or times out on a
+    single attempt; a couple of retries with increasing delay recovers from
+    most transient failures without the user having to click refresh."""
+    last_error = None
+    for attempt in range(retries):
+        try:
+            resp = session.get(url, timeout=10, **kwargs)
+            resp.raise_for_status()
+            return resp
+        except requests.exceptions.RequestException as e:
+            last_error = e
+            if attempt < retries - 1:
+                time.sleep(backoff * (attempt + 1))
+    raise last_error
+
+
 @st.cache_data(ttl=30 * 60, show_spinner=False)
 def fetch_all_buckets():
     session = get_session()
-    resp = session.get(OI_SPURTS_CONTRACTS_URL, timeout=10)
-    resp.raise_for_status()
+    resp = safe_get(session, OI_SPURTS_CONTRACTS_URL)
     data = resp.json()
 
     buckets = {}
@@ -107,12 +123,12 @@ def fetch_technicals(symbols):
 
     for symbol in symbols:
         try:
-            resp = session.get(
+            resp = safe_get(
+                session,
                 HISTORICAL_URL,
+                retries=2,
                 params={"symbol": symbol, "series": '["EQ"]', "from": frm, "to": to},
-                timeout=10,
             )
-            resp.raise_for_status()
             payload = resp.json()
             rows = payload.get("data", [])
             if debug_first_raw is None and rows:
@@ -197,14 +213,13 @@ def fetch_volume_gainers():
     average volume, computed server-side by NSE. This is the reliable
     volume-spike source (unlike the historical-derived calc above)."""
     session = get_session()
-    resp = session.get(VOLUME_GAINERS_URL, timeout=10)
-    resp.raise_for_status()
+    resp = safe_get(session, VOLUME_GAINERS_URL)
     data = resp.json()
     rows = data.get("data", [])
     return rows, data
 
 
-def build_volume_gainers_df(rows):
+def build_volume_gainers_df(rows, sort_col="Volume Spike vs 1wk (%)"):
     records = []
     for r in rows:
         symbol = r.get("symbol")
@@ -222,9 +237,22 @@ def build_volume_gainers_df(rows):
             "Chart": tradingview_url(symbol),
         })
     df = pd.DataFrame(records)
-    if not df.empty:
-        df = df.sort_values("Volume Spike vs 1wk (%)", ascending=False).reset_index(drop=True)
+    if not df.empty and sort_col in df.columns:
+        df = df.sort_values(sort_col, ascending=False).reset_index(drop=True)
     return df
+
+
+def format_nse_timestamp(raw_dict):
+    """NSE timestamps look like '21-Aug-2026 15:40:13'. Falls back gracefully
+    if the format ever changes."""
+    ts = raw_dict.get("timestamp") if isinstance(raw_dict, dict) else None
+    return ts or "unknown"
+
+
+def show_freshness_banner(raw_dict):
+    nse_ts = format_nse_timestamp(raw_dict)
+    fetched_at = datetime.now().strftime("%d-%b-%Y %H:%M:%S")
+    st.info(f"📅 **Data as of (NSE):** {nse_ts}  •  🔄 **Fetched by app at:** {fetched_at}", icon="🕒")
 
 
 def tradingview_url(symbol):
@@ -237,7 +265,7 @@ def tradingview_url(symbol):
     return f"https://www.tradingview.com/chart/?symbol=NSE:{symbol}"
 
 
-def build_dataframe(rows, bucket_key):
+def build_dataframe(rows, bucket_key, sort_col="Change in OI"):
     label, trend, emoji = BUCKET_INFO.get(bucket_key, (bucket_key, bucket_key, ""))
     records = []
     for r in rows:
@@ -256,9 +284,25 @@ def build_dataframe(rows, bucket_key):
             "Chart": tradingview_url(symbol),
         })
     df = pd.DataFrame(records)
-    if not df.empty:
-        df = df.sort_values("Change in OI", key=lambda s: s.abs(), ascending=False).reset_index(drop=True)
+    if not df.empty and sort_col in df.columns:
+        df = df.sort_values(sort_col, key=lambda s: s.abs(), ascending=False).reset_index(drop=True)
     return df
+
+
+def style_change_columns(df):
+    """Color % change columns green/red based on sign, for faster scanning."""
+    color_cols = [c for c in ["% Chg in OI", "% Chg Price", "Volume Spike vs 1wk (%)"] if c in df.columns]
+
+    def colorize(val):
+        if pd.isna(val):
+            return ""
+        if val > 0:
+            return "color: #1a7f37; font-weight: 600;"
+        if val < 0:
+            return "color: #cf222e; font-weight: 600;"
+        return ""
+
+    return df.style.map(colorize, subset=color_cols) if color_cols else df
 
 
 # ---------------- UI ----------------
@@ -301,6 +345,15 @@ with st.expander("⚙️ Filters", expanded=False):
         min_volume = st.number_input("Min Volume", min_value=0, value=500000, step=50000)
     with col2:
         min_price = st.number_input("Min Price (LTP)", min_value=0.0, value=250.0, step=10.0)
+
+    if is_volume_view:
+        sort_col = st.selectbox(
+            "Sort by",
+            ["Volume Spike vs 1wk (%)", "Volume Spike vs 2wk (%)", "% Chg Price", "Volume"],
+        )
+    else:
+        sort_col = st.selectbox("Sort by", ["Change in OI", "% Chg in OI", "% Chg Price", "Volume"])
+
     show_technicals = False
     if not is_volume_view:
         show_technicals = st.checkbox("Add RSI/SMA/Days-Up (experimental, slower)", value=False)
@@ -316,15 +369,12 @@ with st.spinner("Fetching from NSE..."):
     try:
         if is_volume_view:
             vg_rows, vg_raw = fetch_volume_gainers()
-            st.caption(
-                f"Last updated: {datetime.now().strftime('%H:%M:%S')}  •  "
-                f"Auto-refresh #{refresh_count}  •  Next refresh in ~30 min  •  "
-                f"NSE timestamp: {vg_raw.get('timestamp', 'n/a')}"
-            )
+            show_freshness_banner(vg_raw)
+            st.caption(f"Auto-refresh #{refresh_count}  •  Next refresh in ~30 min")
             if not vg_rows:
                 st.warning("No volume-gainer data returned right now.")
             else:
-                vg_df_full = build_volume_gainers_df(vg_rows)
+                vg_df_full = build_volume_gainers_df(vg_rows, sort_col=sort_col)
                 vg_df_filtered = vg_df_full[
                     (vg_df_full["Volume"] >= min_volume) & (vg_df_full["LTP"] >= min_price)
                 ]
@@ -336,9 +386,9 @@ with st.spinner("Fetching from NSE..."):
                 if vg_df.empty:
                     st.warning("No rows match your Volume/Price filters. Try lowering them.")
                 else:
-                    st.success(f"Showing top {len(vg_df)} by 1-week volume spike %.")
+                    st.success(f"Showing top {len(vg_df)}, sorted by {sort_col}.")
                     st.dataframe(
-                        vg_df,
+                        style_change_columns(vg_df),
                         use_container_width=True,
                         hide_index=True,
                         column_config={
@@ -350,18 +400,14 @@ with st.spinner("Fetching from NSE..."):
         else:
             buckets, raw = fetch_all_buckets()
             tech_debug = None
-
-            st.caption(
-                f"Last updated: {datetime.now().strftime('%H:%M:%S')}  •  "
-                f"Auto-refresh #{refresh_count}  •  Next refresh in ~30 min  •  "
-                f"NSE timestamp: {raw.get('timestamp', 'n/a')}"
-            )
+            show_freshness_banner(raw)
+            st.caption(f"Auto-refresh #{refresh_count}  •  Next refresh in ~30 min")
 
             rows = buckets.get(bucket_key, [])
             if not rows:
                 st.warning(f"No contracts currently in the '{selected_view}' bucket.")
             else:
-                df_full = build_dataframe(rows, bucket_key)
+                df_full = build_dataframe(rows, bucket_key, sort_col=sort_col)
                 df_filtered = df_full[
                     (df_full["Volume"] >= min_volume) & (df_full["LTP"] >= min_price)
                 ]
@@ -407,9 +453,9 @@ with st.spinner("Fetching from NSE..."):
                         if missing:
                             st.caption(f"⚠️ Couldn't compute RSI/SMA for: {', '.join(missing)} (unverified endpoint — see debug)")
 
-                    st.success(f"Showing top {len(df_top)} of {len(df_filtered)} matching contracts by |Change in OI|.")
+                    st.success(f"Showing top {len(df_top)} of {len(df_filtered)} matching contracts, sorted by {sort_col}.")
                     st.dataframe(
-                        df_top,
+                        style_change_columns(df_top),
                         use_container_width=True,
                         hide_index=True,
                         column_config={
