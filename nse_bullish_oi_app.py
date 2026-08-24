@@ -13,7 +13,7 @@ These are descriptive stats based on current/historical data — not trade
 signals, entries, stop-losses, or targets. Always do your own risk
 management.
 
-Auto-refreshes every 30 minutes.
+Auto-refreshes every 15 minutes.
 
 Run locally (needs internet access to nseindia.com):
 
@@ -51,7 +51,7 @@ HEADERS = {
     "Referer": f"{BASE}/market-data/oi-change",
 }
 
-REFRESH_INTERVAL_MS = 15 * 60 * 1000  # 30 minutes
+REFRESH_INTERVAL_MS = 15 * 60 * 1000  # 15 minutes
 REQUEST_DELAY_SEC = 0.4
 
 # Candidate field names for the historical endpoint (schema unverified from
@@ -109,7 +109,7 @@ def fetch_all_buckets():
     return buckets, data
 
 
-@st.cache_data(ttl=30 * 60, show_spinner=False)
+@st.cache_data(ttl=15 * 60, show_spinner=False)
 def fetch_technicals(symbols):
     """Fetch ~90 calendar days of daily history per symbol and compute
     RSI(14), SMA(20), volume spike ratio, and consecutive days-up streak."""
@@ -207,7 +207,7 @@ def compute_technicals(parsed):
     }
 
 
-@st.cache_data(ttl=30 * 60, show_spinner=False)
+@st.cache_data(ttl=15 * 60, show_spinner=False)
 def fetch_volume_gainers():
     """Confirmed-working NSE endpoint: today's volume vs 1-week and 2-week
     average volume, computed server-side by NSE. This is the reliable
