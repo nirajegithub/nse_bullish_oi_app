@@ -51,7 +51,7 @@ HEADERS = {
     "Referer": f"{BASE}/market-data/oi-change",
 }
 
-REFRESH_INTERVAL_MS = 30 * 60 * 1000  # 30 minutes
+REFRESH_INTERVAL_MS = 15 * 60 * 1000  # 30 minutes
 REQUEST_DELAY_SEC = 0.4
 
 # Candidate field names for the historical endpoint (schema unverified from
@@ -95,7 +95,7 @@ def safe_get(session, url, retries=3, backoff=1.5, **kwargs):
     raise last_error
 
 
-@st.cache_data(ttl=30 * 60, show_spinner=False)
+@st.cache_data(ttl=15 * 60, show_spinner=False)
 def fetch_all_buckets():
     session = get_session()
     resp = safe_get(session, OI_SPURTS_CONTRACTS_URL)
